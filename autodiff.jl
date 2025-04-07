@@ -43,11 +43,24 @@ end
 
 mutable struct BroadcastedOperator{F, T} <: Operator
     inputs :: Vector{GraphNode}
-    output :: Union{Vector{T}, Nothing}
-    gradient :: Union{Vector{T}, Nothing}
+    output :: Union{T, AbstractArray{T}, Nothing}
+    gradient :: Union{T, AbstractArray{T}, Nothing}
     name :: String
-    BroadcastedOperator(fun::F, inputs::GraphNode...; name::String="?") where {F} = 
+    function BroadcastedOperator(fun::F, inputs::GraphNode...; name="") where {F}
+        # Pobierz typ T na podstawie pierwszego elementu inputs
+        T = promote_type(map(x -> begin
+            if x isa Variable
+                eltype(x.output)
+            elseif x isa Constant
+                eltype(x.output)
+            elseif x isa Operator
+                eltype(x.output)
+            else
+                error("Unsupported input type for BroadcastedOperator")
+            end
+        end, inputs)...)
         new{F, T}(collect(inputs), nothing, nothing, name)
+    end
 end
 
 function visit(node::GraphNode, visited::Set{GraphNode}, order::Vector{GraphNode})
@@ -79,6 +92,7 @@ end
 reset!(node::Constant) = nothing
 reset!(node::Variable) = node.gradient = nothing
 reset!(node::Operator) = node.gradient = nothing
+Base.Broadcast.broadcastable(x::AutoDiff.GraphNode) = Ref(x)
 
 compute!(node::Constant) = nothing
 compute!(node::Variable) = nothing
@@ -152,5 +166,54 @@ import Base: *
 *(x::GraphNode, y::GraphNode) = ScalarOperator(*, x, y)
 forward(::ScalarOperator{typeof(*)}, x, y) = x * y
 backward(::ScalarOperator{typeof(*)}, x, y, g) = (g * y, g * x)
+
+# Odejmowanie (-) dla ScalarOperator
+import Base: -
+-(x::GraphNode, y::GraphNode) = ScalarOperator(-, x, y)
+forward(::ScalarOperator{typeof(-)}, x, y) = x - y
+backward(::ScalarOperator{typeof(-)}, x, y, g) = (g, -g)
+
+# Dodawanie (+) dla ScalarOperator
+import Base: +
++(x::GraphNode, y::GraphNode) = ScalarOperator(+, x, y)
+forward(::ScalarOperator{typeof(+)}, x, y) = x + y
+backward(::ScalarOperator{typeof(+)}, x, y, g) = (g, g)
+
+
+# -----------------------------------BroadcastedOperator--------------------------------
+
+import Base: exp
+exp(x::GraphNode) = BroadcastedOperator(exp, x)
+forward(::BroadcastedOperator{typeof(exp)}, x) = exp.(x)
+backward(::BroadcastedOperator{typeof(exp)}, x, g) = (g .* exp.(x),)
+
+# Sumowanie dla BroadcastedOperator
+import Base: sum
+sum(x::GraphNode) = BroadcastedOperator(sum, x)
+forward(::BroadcastedOperator{typeof(sum)}, x) = sum(x)
+backward(::BroadcastedOperator{typeof(sum)}, x, g) = (fill(g, size(x)),)
+
+import Base: *
+import LinearAlgebra: mul!
+# x * y (aka matrix multiplication)
+*(A::GraphNode, x::GraphNode) = BroadcastedOperator(mul!, A, x)
+forward(::BroadcastedOperator{typeof(mul!)}, A, x) = return A * x
+backward(node::BroadcastedOperator{typeof(mul!)}, A, x, g) = begin
+    g_mat = isa(g, Number) ? fill(g, size(node.output)) : g
+    dA = g_mat * x'
+    dx = A' * g_mat
+    return (dA, dx)
+end
+
+
+# x .* y (element-wise multiplication)
+Base.Broadcast.broadcasted(*, x::GraphNode, y::GraphNode) = BroadcastedOperator(*, x, y)
+forward(::BroadcastedOperator{typeof(*)}, x, y) = return x .* y
+backward(node::BroadcastedOperator{typeof(*)}, x, y, g) = let
+    𝟏 = ones(length(node.output))
+    Jx = diagm(y .* 𝟏)
+    Jy = diagm(x .* 𝟏)
+    tuple(Jx' * g, Jy' * g)
+end
 
 end # module AutoDiff
